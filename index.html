@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Acoustic Data Link (Fixed 7-Bit ASCII)</title>
+  <style>
+    body { 
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+      max-width: 720px; 
+      margin: 40px auto; 
+      padding: 0 16px; 
+      line-height: 1.5; 
+      color: #222;
+    }
+    .card { 
+      border: 1px solid #d0d7de; 
+      border-radius: 8px; 
+      padding: 20px; 
+      margin-bottom: 20px; 
+      background-color: #f6f8fa;
+    }
+    button { 
+      padding: 10px 16px; 
+      font-weight: 600; 
+      cursor: pointer; 
+      margin-right: 8px; 
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fff;
+    }
+    button:hover:not(:disabled) {
+      background-color: #f0f0f0;
+    }
+    button:disabled { 
+      opacity: 0.5; 
+      cursor: not-allowed; 
+    }
+    input[type="text"], input[type="number"] { 
+      padding: 8px 12px; 
+      font-size: 16px; 
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      margin-right: 8px;
+    }
+    input[type="text"] { width: 65%; }
+    #log { 
+      background: #0d1117; 
+      color: #39d353; 
+      padding: 14px; 
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; 
+      font-size: 13px;
+      height: 180px; 
+      overflow-y: auto; 
+      border-radius: 6px; 
+      margin-top: 12px;
+    }
+    .mode-select { margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+
+  <h2>Covert Acoustic Data Link (Fixed 7-Bit ASCII)</h2>
+
+  <div class="card">
+    <div class="mode-select">
+      <label><strong>Frequency Band:</strong></label>&nbsp;
+      <input type="radio" id="bandUltra" name="band" value="ultra" checked>
+      <label for="bandUltra">Near-Ultrasonic (~17.5–19.6 kHz)</label>&nbsp;&nbsp;
+      <input type="radio" id="bandAudible" name="band" value="audible">
+      <label for="bandAudible">Audible Debug (~1.5–2.2 kHz)</label>
+    </div>
+  </div>
+
+  <!-- Transmitter Card -->
+  <div class="card">
+    <h3>1. Transmitter</h3>
+    <input type="text" id="txInput" value="IEEE" maxlength="12" placeholder="Enter message">
+    <button id="txBtn">Transmit Sound</button>
+    <p><small>Sends a 200ms sync preamble followed by raw 7-bit ASCII characters (no ETX/checksum).</small></p>
+  </div>
+
+  <!-- Receiver Card -->
+  <div class="card">
+    <h3>2. Receiver</h3>
+    <label for="rxCharCount"><strong>Expected Characters:</strong></label>
+    <input type="number" id="rxCharCount" value="4" min="1" max="16" style="width: 60px;">
+    <button id="rxBtn">Start Listening</button>
+    <button id="rxStopBtn" disabled>Stop Listening</button>
+    <p><strong>Decoded Output:</strong> <span id="rxOutput" style="font-size: 22px; color: #0969da; font-weight: bold;"></span></p>
+    <div id="log">--- Receiver Log ---<br></div>
+  </div>
+
+<script>
+let audioCtx = null;
+let micStream = null;
+let isListening = false;
+let rxInterval = null;
+
+function getAudioContext() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return audioCtx;
+}
+
+function getFrequencies() {
+  const isUltra = document.getElementById('bandUltra').checked;
+  return isUltra 
+    ? { sync: 17500, bit0: 18600, bit1: 19600 } 
+    : { sync: 1500,  bit0: 1800,  bit1: 2200 };
+}
+
+const BIT_DURATION = 0.12;  // 120ms per data bit
+const SYNC_DURATION = 0.20; // 200ms preamble tone for reliable lock
+
+const logEl = document.getElementById('log');
+function log(msg) {
+  logEl.innerHTML += `${msg}<br>`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Hardware Cleanup
+function stopListening() {
+  if (rxInterval) {
+    clearInterval(rxInterval);
+    rxInterval = null;
+  }
+  if (micStream) {
+    micStream.getTracks().forEach(track => track.stop());
+    micStream = null;
+  }
+  isListening = false;
+  document.getElementById('rxBtn').disabled = false;
+  document.getElementById('rxStopBtn').disabled = true;
+  log("Microphone released. Normal system audio restored.");
+}
+
+window.addEventListener('beforeunload', stopListening);
+document.getElementById('rxStopBtn').addEventListener('click', stopListening);
+
+
+// --- TRANSMITTER ---
+document.getElementById('txBtn').addEventListener('click', async () => {
+  const ctx = getAudioContext();
+  await ctx.resume();
+
+  const rawInput = document.getElementById('txInput').value;
+  const asciiText = rawInput.replace(/[^\x00-\x7F]/g, '');
+
+  if (!asciiText) {
+    log("TX Error: Please enter valid ASCII text.");
+    return;
+  }
+
+  const freqs = getFrequencies();
+  const bits = [];
+
+  // 7 bits per character (MSB to LSB)
+  for (let i = 0; i < asciiText.length; i++) {
+    const code = asciiText.charCodeAt(i) & 0x7F;
+    for (let b = 6; b >= 0; b--) {
+      bits.push((code >> b) & 1);
+    }
+  }
+
+  log(`Transmitting: "${asciiText}" (${bits.length} data bits)...`);
+  let cursor = ctx.currentTime + 0.05;
+
+  // 1. Send Sync Preamble (200ms)
+  const syncOsc = ctx.createOscillator();
+  const syncGain = ctx.createGain();
+  syncOsc.frequency.setValueAtTime(freqs.sync, cursor);
+
+  syncGain.gain.setValueAtTime(0, cursor);
+  syncGain.gain.linearRampToValueAtTime(0.1, cursor + 0.01);
+  syncGain.gain.setValueAtTime(0.1, cursor + SYNC_DURATION - 0.01);
+  syncGain.gain.linearRampToValueAtTime(0, cursor + SYNC_DURATION);
+
+  syncOsc.connect(syncGain);
+  syncGain.connect(ctx.destination);
+  syncOsc.start(cursor);
+  syncOsc.stop(cursor + SYNC_DURATION);
+
+  cursor += SYNC_DURATION;
+
+  // 2. Send 7-bit Data Stream
+  bits.forEach((bit) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const targetFreq = (bit === 1) ? freqs.bit1 : freqs.bit0;
+
+    osc.frequency.setValueAtTime(targetFreq, cursor);
+
+    gain.gain.setValueAtTime(0, cursor);
+    gain.gain.linearRampToValueAtTime(0.1, cursor + 0.008);
+    gain.gain.setValueAtTime(0.1, cursor + BIT_DURATION - 0.008);
+    gain.gain.linearRampToValueAtTime(0, cursor + BIT_DURATION);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(cursor);
+    osc.stop(cursor + BIT_DURATION);
+
+    cursor += BIT_DURATION;
+  });
+});
+
+
+// --- RECEIVER ---
+document.getElementById('rxBtn').addEventListener('click', async () => {
+  if (isListening) return;
+  const ctx = getAudioContext();
+  await ctx.resume();
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+  } catch (err) {
+    log(`Microphone Error: ${err.message}`);
+    return;
+  }
+
+  const source = ctx.createMediaStreamSource(micStream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 4096;
+  source.connect(analyser);
+
+  isListening = true;
+  document.getElementById('rxBtn').disabled = true;
+  document.getElementById('rxStopBtn').disabled = false;
+  document.getElementById('rxOutput').innerText = "";
+  log("Listening for transmission...");
+
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = new Float32Array(bufferLength);
+  const binWidth = ctx.sampleRate / analyser.fftSize;
+
+  function getPowerAt(freq) {
+    const bin = Math.round(freq / binWidth);
+    return dataArray[bin];
+  }
+
+  const expectedChars = parseInt(document.getElementById('rxCharCount').value || 4, 10);
+  const totalTargetBits = expectedChars * 7;
+
+  let state = "IDLE";
+  let receivedBits = [];
+  let sampleCount = 0;
+  const samplesPerBit = Math.round((BIT_DURATION * 1000) / 40); // 3 samples per 120ms at 40ms polling
+
+  rxInterval = setInterval(() => {
+    if (!isListening) return;
+
+    analyser.getFloatFrequencyData(dataArray);
+    const freqs = getFrequencies();
+
+    const pSync = getPowerAt(freqs.sync);
+    const p0 = getPowerAt(freqs.bit0);
+    const p1 = getPowerAt(freqs.bit1);
+    const threshold = -70; // dB minimum signal floor
+
+    if (state === "IDLE") {
+      // Detect incoming sync preamble
+      if (pSync > threshold && pSync > p0 + 10 && pSync > p1 + 10) {
+        state = "SYNC_ACTIVE";
+        log("Sync tone acquired. Locking phase...");
+        receivedBits = [];
+        sampleCount = 0;
+      }
+    } 
+    else if (state === "SYNC_ACTIVE") {
+      // Detect falling edge of the sync tone to start the bit clock
+      if (pSync < threshold || p0 > pSync || p1 > pSync) {
+        state = "READING_DATA";
+        sampleCount = 0;
+        log("Sync ended. Reading data bits...");
+      }
+    } 
+    else if (state === "READING_DATA") {
+      sampleCount++;
+
+      // Sample in the middle of each symbol period
+      if (sampleCount === Math.floor(samplesPerBit / 2)) {
+        const bit = (p1 > p0) ? 1 : 0;
+        receivedBits.push(bit);
+
+        // Decode every full 7-bit character
+        if (receivedBits.length % 7 === 0) {
+          let charCode = 0;
+          const currentBits = receivedBits.slice(-7);
+          for (let b = 0; b < 7; b++) {
+            charCode = (charCode << 1) | currentBits[b];
+          }
+          const char = String.fromCharCode(charCode);
+          document.getElementById('rxOutput').innerText += char;
+          log(`Decoded char: '${char}' (Code: ${charCode})`);
+        }
+
+        // Hard stop once the requested character count is reached
+        if (receivedBits.length >= totalTargetBits) {
+          log(`Reception complete (${expectedChars} chars received).`);
+          state = "IDLE";
+          stopListening();
+        }
+      } 
+      else if (sampleCount >= samplesPerBit) {
+        sampleCount = 0;
+      }
+    }
+  }, 40);
+});
+</script>
+</body>
+</html>
