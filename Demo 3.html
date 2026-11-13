@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Acoustic Data Link (Hamming 11,7 + ASCII ETX)</title>
+  <style>
+    body { 
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+      max-width: 740px; 
+      margin: 40px auto; 
+      padding: 0 16px; 
+      line-height: 1.5; 
+      color: #222;
+    }
+    .card { 
+      border: 1px solid #d0d7de; 
+      border-radius: 8px; 
+      padding: 20px; 
+      margin-bottom: 20px; 
+      background-color: #f6f8fa;
+    }
+    button { 
+      padding: 10px 16px; 
+      font-weight: 600; 
+      cursor: pointer; 
+      margin-right: 8px; 
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fff;
+    }
+    button:hover:not(:disabled) {
+      background-color: #f0f0f0;
+    }
+    button:disabled { 
+      opacity: 0.5; 
+      cursor: not-allowed; 
+    }
+    input[type="text"] { 
+      width: 65%; 
+      padding: 8px 12px; 
+      font-size: 16px; 
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      margin-right: 8px;
+    }
+    .fault-toggle {
+      margin-top: 12px;
+      padding: 8px 12px;
+      background: #fff8c5;
+      border: 1px solid #d4a72c;
+      border-radius: 6px;
+      display: inline-block;
+    }
+    #log { 
+      background: #0d1117; 
+      color: #39d353; 
+      padding: 14px; 
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; 
+      font-size: 13px;
+      height: 240px; 
+      overflow-y: auto; 
+      border-radius: 6px; 
+      margin-top: 12px;
+    }
+    .mode-select { margin-bottom: 12px; }
+  </style>
+</head>
+<body>
+
+  <h2>Covert Acoustic Data Link — Hamming(11,7) + ASCII ETX</h2>
+
+  <div class="card">
+    <div class="mode-select">
+      <label><strong>Frequency Band:</strong></label>&nbsp;
+      <input type="radio" id="bandUltra" name="band" value="ultra" checked>
+      <label for="bandUltra">Near-Ultrasonic (~16.0–17.6 kHz)</label>&nbsp;&nbsp;
+      <input type="radio" id="bandAudible" name="band" value="audible">
+      <label for="bandAudible">Audible Debug (~1.5–2.2 kHz)</label>
+    </div>
+  </div>
+
+  <!-- Transmitter Card -->
+  <div class="card">
+    <h3>1. Transmitter</h3>
+    <input type="text" id="txInput" value="IEEE" maxlength="16" placeholder="Enter ASCII message">
+    <button id="txBtn">Transmit Sound</button>
+    <br>
+    <label class="fault-toggle">
+      <input type="checkbox" id="injectError">
+      <strong>Demo Mode:</strong> Intentionally flip 1 random bit per character
+    </label>
+    <p><small>Encodes each 7-bit ASCII character into an 11-bit Hamming(11,7) codeword and appends a Hamming-encoded ASCII ETX (0x03) terminator.</small></p>
+  </div>
+
+  <!-- Receiver Card -->
+  <div class="card">
+    <h3>2. Receiver</h3>
+    <button id="rxBtn">Start Listening</button>
+    <button id="rxStopBtn" disabled>Stop Listening</button>
+    <p><strong>Decoded Output:</strong> <span id="rxOutput" style="font-size: 22px; color: #0969da; font-weight: bold;"></span></p>
+    <div id="log">--- Receiver Log ---<br></div>
+  </div>
+
+<script>
+let audioCtx = null;
+let micStream = null;
+let isListening = false;
+let rxInterval = null;
+
+function getAudioContext() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  return audioCtx;
+}
+
+function getFrequencies() {
+  const isUltra = document.getElementById('bandUltra').checked;
+  return isUltra 
+    ? { sync: 16000, bit0: 16800, bit1: 17600 } 
+    : { sync: 1500,  bit0: 1800,  bit1: 2200 };
+}
+
+const BIT_DURATION = 0.14;  // 140ms per bit
+const SYNC_DURATION = 0.25; // 250ms sync preamble
+const ASCII_ETX = 0x03;     // End-of-Text control character
+
+const logEl = document.getElementById('log');
+function log(msg) {
+  logEl.innerHTML += `${msg}<br>`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// --- HAMMING(11,7) ENCODER & DECODER ---
+function encodeHamming11_7(asciiCode) {
+  const d1 = (asciiCode >> 6) & 1;
+  const d2 = (asciiCode >> 5) & 1;
+  const d3 = (asciiCode >> 4) & 1;
+  const d4 = (asciiCode >> 3) & 1;
+  const d5 = (asciiCode >> 2) & 1;
+  const d6 = (asciiCode >> 1) & 1;
+  const d7 = (asciiCode >> 0) & 1;
+
+  const p1 = d1 ^ d2 ^ d4 ^ d5 ^ d7;
+  const p2 = d1 ^ d3 ^ d4 ^ d6 ^ d7;
+  const p4 = d2 ^ d3 ^ d4;
+  const p8 = d5 ^ d6 ^ d7;
+
+  return [p1, p2, d1, p4, d2, d3, d4, p8, d5, d6, d7];
+}
+
+function decodeHamming11_7(bits11) {
+  const c = [0, ...bits11];
+
+  const s1 = c[1] ^ c[3] ^ c[5] ^ c[7] ^ c[9]  ^ c[11];
+  const s2 = c[2] ^ c[3] ^ c[6] ^ c[7] ^ c[10] ^ c[11];
+  const s4 = c[4] ^ c[5] ^ c[6] ^ c[7];
+  const s8 = c[8] ^ c[9] ^ c[10] ^ c[11];
+
+  const errorPos = (s8 << 3) | (s4 << 2) | (s2 << 1) | s1;
+  let status = "OK (Syndrome: 0)";
+
+  if (errorPos >= 1 && errorPos <= 11) {
+    c[errorPos] ^= 1;
+    status = `REPAIRED (Flipped bit at pos ${errorPos})`;
+  } else if (errorPos > 11) {
+    status = `UNCORRECTABLE (Syndrome ${errorPos} > 11, multi-bit error)`;
+  }
+
+  const dataBits = [c[3], c[5], c[6], c[7], c[9], c[10], c[11]];
+  let charCode = 0;
+  for (let i = 0; i < 7; i++) {
+    charCode = (charCode << 1) | dataBits[i];
+  }
+
+  return { charCode, status };
+}
+
+// --- HARDWARE CLEANUP ---
+function stopListening() {
+  if (rxInterval) {
+    clearInterval(rxInterval);
+    rxInterval = null;
+  }
+  if (micStream) {
+    micStream.getTracks().forEach(track => track.stop());
+    micStream = null;
+  }
+  isListening = false;
+  document.getElementById('rxBtn').disabled = false;
+  document.getElementById('rxStopBtn').disabled = true;
+  log("Microphone released. System audio restored.");
+}
+
+window.addEventListener('beforeunload', stopListening);
+document.getElementById('rxStopBtn').addEventListener('click', stopListening);
+
+
+// --- TRANSMITTER ---
+document.getElementById('txBtn').addEventListener('click', async () => {
+  const ctx = getAudioContext();
+  await ctx.resume();
+
+  const rawInput = document.getElementById('txInput').value;
+  const asciiText = rawInput.replace(/[^\x00-\x7F]/g, '');
+
+  if (!asciiText) {
+    log("TX Error: Enter valid ASCII text.");
+    return;
+  }
+
+  const freqs = getFrequencies();
+  const injectError = document.getElementById('injectError').checked;
+  const bits = [];
+
+  for (let i = 0; i < asciiText.length; i++) {
+    const code = asciiText.charCodeAt(i) & 0x7F;
+    const codeword = encodeHamming11_7(code);
+
+    if (injectError) {
+      const flipIdx = Math.floor(Math.random() * 11);
+      codeword[flipIdx] ^= 1;
+      log(`TX Fault Injection: Flipped bit at pos ${flipIdx + 1} in '${asciiText[i]}'`);
+    }
+
+    bits.push(...codeword);
+  }
+
+  // Append Hamming-encoded ASCII ETX (0x03) terminator
+  const etxCodeword = encodeHamming11_7(ASCII_ETX);
+  bits.push(...etxCodeword);
+
+  log(`Transmitting "${asciiText}" + ETX (${bits.length} total Hamming bits)...`);
+  let cursor = ctx.currentTime + 0.05;
+
+  // 1. Schedule Sync Preamble
+  const syncOsc = ctx.createOscillator();
+  const syncGain = ctx.createGain();
+  syncOsc.frequency.setValueAtTime(freqs.sync, cursor);
+
+  syncGain.gain.setValueAtTime(0, cursor);
+  syncGain.gain.linearRampToValueAtTime(0.12, cursor + 0.01);
+  syncGain.gain.setValueAtTime(0.12, cursor + SYNC_DURATION - 0.01);
+  syncGain.gain.linearRampToValueAtTime(0, cursor + SYNC_DURATION);
+
+  syncOsc.connect(syncGain);
+  syncGain.connect(ctx.destination);
+  syncOsc.start(cursor);
+  syncOsc.stop(cursor + SYNC_DURATION);
+
+  cursor += SYNC_DURATION;
+
+  // 2. Schedule 11-bit Hamming Codewords (Payload + ETX)
+  bits.forEach((bit) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const targetFreq = (bit === 1) ? freqs.bit1 : freqs.bit0;
+
+    osc.frequency.setValueAtTime(targetFreq, cursor);
+
+    gain.gain.setValueAtTime(0, cursor);
+    gain.gain.linearRampToValueAtTime(0.12, cursor + 0.008);
+    gain.gain.setValueAtTime(0.12, cursor + BIT_DURATION - 0.008);
+    gain.gain.linearRampToValueAtTime(0, cursor + BIT_DURATION);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(cursor);
+    osc.stop(cursor + BIT_DURATION);
+
+    cursor += BIT_DURATION;
+  });
+});
+
+
+// --- RECEIVER ---
+document.getElementById('rxBtn').addEventListener('click', async () => {
+  if (isListening) return;
+  const ctx = getAudioContext();
+  await ctx.resume();
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+    });
+  } catch (err) {
+    log(`Microphone Error: ${err.message}`);
+    return;
+  }
+
+  const source = ctx.createMediaStreamSource(micStream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 4096;
+  analyser.smoothingTimeConstant = 0.0;
+  source.connect(analyser);
+
+  isListening = true;
+  document.getElementById('rxBtn').disabled = true;
+  document.getElementById('rxStopBtn').disabled = false;
+  document.getElementById('rxOutput').innerText = "";
+  log("Listening for Hamming(11,7) frames...");
+
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = new Float32Array(bufferLength);
+  const binWidth = ctx.sampleRate / analyser.fftSize;
+
+  function getPowerAt(freq) {
+    const center = Math.round(freq / binWidth);
+    return Math.max(
+      dataArray[center - 1] ?? -120,
+      dataArray[center]     ?? -120,
+      dataArray[center + 1] ?? -120
+    );
+  }
+
+  const maxSafetyBits = 32 * 11; // Safety cap if ETX suffers a multi-bit error
+  let state = "IDLE";
+  let receivedBits = [];
+  let dataStartTime = 0;
+  let nextBitIndex = 0;
+
+  rxInterval = setInterval(() => {
+    if (!isListening) return;
+
+    analyser.getFloatFrequencyData(dataArray);
+    const freqs = getFrequencies();
+
+    const pSync = getPowerAt(freqs.sync);
+    const p0 = getPowerAt(freqs.bit0);
+    const p1 = getPowerAt(freqs.bit1);
+    const threshold = -72;
+
+    if (state === "IDLE") {
+      if (pSync > threshold && pSync > p0 + 8 && pSync > p1 + 8) {
+        state = "SYNC_ACTIVE";
+        log("Sync tone acquired. Waiting for falling edge...");
+        receivedBits = [];
+      }
+    } 
+    else if (state === "SYNC_ACTIVE") {
+      if (pSync < threshold || p0 > pSync + 3 || p1 > pSync + 3) {
+        state = "READING_DATA";
+        dataStartTime = ctx.currentTime;
+        nextBitIndex = 0;
+        log("Sync complete. Sampling 11-bit Hamming blocks...");
+      }
+    } 
+    else if (state === "READING_DATA") {
+      const targetSampleTime = dataStartTime + (nextBitIndex + 0.5) * BIT_DURATION;
+
+      if (ctx.currentTime >= targetSampleTime) {
+        const bit = (p1 > p0) ? 1 : 0;
+        receivedBits.push(bit);
+        nextBitIndex++;
+
+        if (receivedBits.length % 11 === 0) {
+          const currentBlock = receivedBits.slice(-11);
+          const { charCode, status } = decodeHamming11_7(currentBlock);
+
+          if (charCode === ASCII_ETX) {
+            log(`Block [${currentBlock.join('')}] -> ETX (End-of-Text) | ${status}`);
+            log("Reception complete.");
+            state = "IDLE";
+            stopListening();
+            return;
+          }
+
+          const displayChar = (charCode >= 32 && charCode <= 126)
+            ? String.fromCharCode(charCode)
+            : '?';
+
+          document.getElementById('rxOutput').innerText += displayChar;
+          log(`Block [${currentBlock.join('')}] -> '${displayChar}' (ASCII ${charCode}) | ${status}`);
+        }
+
+        if (receivedBits.length >= maxSafetyBits) {
+          log("Max frame limit reached without ETX. Stopping.");
+          state = "IDLE";
+          stopListening();
+        }
+      }
+    }
+  }, 15);
+});
+</script>
+</body>
+</html>
